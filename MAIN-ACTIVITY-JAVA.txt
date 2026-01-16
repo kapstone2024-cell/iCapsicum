@@ -1,0 +1,1436 @@
+    package com.application.icapsicum;
+    
+    import android.app.AlarmManager;
+    import android.app.NotificationChannel;
+    import android.app.NotificationManager;
+    import android.app.PendingIntent;
+    import android.content.Context;
+    import android.content.Intent;
+    import android.content.pm.PackageManager;
+    import android.graphics.Color;
+    import android.net.ConnectivityManager;
+    import android.net.Network;
+    import android.net.NetworkCapabilities;
+    import android.os.Build;
+    import android.os.Bundle;
+    import android.os.SystemClock;
+    import android.util.TypedValue;
+    import android.view.View;
+    import android.view.ViewGroup;
+    import android.view.Window;
+    import android.view.WindowInsets;
+    import android.view.WindowInsetsController;
+    import android.widget.Button;
+    import android.widget.ImageView;
+    import android.widget.TextView;
+    import android.widget.Toast;
+    import android.net.wifi.WifiInfo;
+    import android.net.wifi.WifiManager;
+    
+    
+    import androidx.annotation.NonNull;
+    import androidx.appcompat.app.AlertDialog;
+    import androidx.appcompat.app.AppCompatActivity;
+    import androidx.core.app.NotificationCompat;
+    import androidx.core.content.ContextCompat;
+    import androidx.core.graphics.Insets;
+    import androidx.core.view.ViewCompat;
+    import androidx.core.view.WindowCompat;
+    import androidx.core.view.WindowInsetsCompat;
+    import androidx.fragment.app.Fragment;
+    import androidx.fragment.app.FragmentManager;
+    
+    import com.google.android.material.bottomnavigation.BottomNavigationView;
+    import com.google.firebase.auth.FirebaseAuth;
+    import com.google.firebase.database.DatabaseReference;
+    import com.google.firebase.database.FirebaseDatabase;
+    import com.google.firebase.messaging.FirebaseMessaging;
+    
+    import java.util.HashMap;
+    import java.util.List;
+    import java.util.Map;
+    
+    /** Main with simple/clean connectivity popups (manual-timer style). */
+    public class MainActivity extends AppCompatActivity {
+    
+        private static final String TAG = "MainActivity";
+        private static final String CHANNEL_ID = "push_general";
+        private boolean enteredLimitedDueToNoInternet = false;
+    
+    
+        // Local role cache keys
+        private static final String PREFS_USER   = "UserPrefs";
+        private static final String KEY_ROLE     = "cachedRole";
+        private static final String DEFAULT_ROLE = "user";
+
+        // Add these fields in MainActivity
+        private boolean primedTemp = false;
+        private boolean primedHum  = false;
+        private boolean primedSoil = false;
+        private boolean primedWater= false;
+
+        private BottomNavigationView bottomNav;
+        private long lastNotifTime = 0;
+        // add:
+        private boolean isUiVisible = false;
+    
+        private boolean canOperateUi() {
+            return isUiVisible
+                    && !isFinishing()
+                    && !isDestroyed()
+                    && !getSupportFragmentManager().isStateSaved();
+        }
+    
+        // Fragments
+        private Fragment homeFrag      = new HomeFragment();
+        private Fragment plantCareFrag = new PlantCareFragment();
+        private Fragment growthFrag    = new GrowthStageFragment(); // shown in LIMITED if admin
+        private Fragment capsiFrag     = new CapsiViewFragment();   // hidden in LIMITED even for admin
+        private Fragment settingsFrag  = new SettingFragment();     // supports limited mode UI
+    
+        private Fragment active;
+        private String userRole = DEFAULT_ROLE;
+        private long lastNavClick = 0L;
+        private FirebaseAuth.AuthStateListener authListener;
+    
+        private static String lastNotifMsg = "";
+        private String lastWaterState = "";
+        private String lastSoilStatus = "";
+        private String lastTemperatureState = "";
+        private String lastFertilizerState = "";
+        private String lastStatus = "";
+    
+        // LIMITED mode flag
+        private boolean limitedMode = false;
+    
+        // Connectivity watcher + dialogs
+        private ConnectivityManager connectivityManager;
+        private ConnectivityManager.NetworkCallback networkCallback;
+        private AlertDialog connectionDialog;   // no internet dialog (online mode)
+        private AlertDialog restoredDialog;     // internet restored (limited mode)
+        private AlertDialog offlineStartDialog; // first-run offline info
+    
+        // ---------- Role helpers ----------
+        private @NonNull String normalizeRole(String roleRaw) {
+            if (roleRaw == null) return DEFAULT_ROLE;
+            String r = roleRaw.trim().toLowerCase();
+            if (r.isEmpty()) return DEFAULT_ROLE;
+            if (!"admin".equals(r) && !"user".equals(r)) return DEFAULT_ROLE;
+            return r;
+        }
+    
+        private void setRoleEverywhere(@NonNull String roleRaw) {
+            String normalized = normalizeRole(roleRaw);
+            userRole = normalized;
+            UserSession.role = normalized;
+            saveCachedRole(normalized);
+        }
+        // -----------------------------------
+    
+        @Override
+        protected void onCreate(Bundle savedInstanceState) {
+            super.onCreate(savedInstanceState);
+            setContentView(R.layout.activity_main);
+    
+            Intent startIntent = getIntent();
+            if (startIntent != null) {
+                String mode = startIntent.getStringExtra("mode");
+                limitedMode = "limited".equalsIgnoreCase(mode);
+            }
+    
+            String cached = normalizeRole(loadCachedRole());
+            setRoleEverywhere(cached);
+            if (UserSession.role != null && !UserSession.role.isEmpty()) {
+                setRoleEverywhere(UserSession.role);
+            }
+    
+    
+            createNotificationChannel();
+            scheduleNotification();
+    
+            bottomNav = findViewById(R.id.bottom_navigation);
+    
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{android.Manifest.permission.ACCESS_FINE_LOCATION}, 1001);
+                }
+            }
+    
+    
+            // Edge-to-edge bottom padding
+            WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+            View root = findViewById(R.id.main);
+            if (root != null && bottomNav != null) {
+                ViewCompat.setOnApplyWindowInsetsListener(root, (v, insets) -> {
+                    Insets bars = getStableSystemBarInsets(insets);
+                    bottomNav.setPadding(
+                            bottomNav.getPaddingLeft(),
+                            bottomNav.getPaddingTop(),
+                            bottomNav.getPaddingRight(),
+                            bars.bottom
+                    );
+                    return insets;
+                });
+            }
+    
+            if (settingsFrag instanceof SettingFragment) {
+                ((SettingFragment) settingsFrag).setLimitedMode(limitedMode);
+            }
+    
+            FirebaseMessaging.getInstance().getToken()
+                    .addOnCompleteListener(task -> {
+                        if (!task.isSuccessful()) return;
+                    });
+    
+            getSupportFragmentManager().addOnBackStackChangedListener(this::updateBottomNavVisibility);
+            getSupportFragmentManager().registerFragmentLifecycleCallbacks(
+                    new FragmentManager.FragmentLifecycleCallbacks() {
+                        @Override
+                        public void onFragmentResumed(@NonNull FragmentManager fm, @NonNull Fragment f) {
+                            updateBottomNavVisibility();
+                        }
+                        @Override
+                        public void onFragmentViewCreated(@NonNull FragmentManager fm, @NonNull Fragment f, @NonNull View v, Bundle s) {
+                            updateBottomNavVisibility();
+                        }
+                    }, true
+            );
+    
+            authListener = fa -> {
+                if (fa.getCurrentUser() == null) {
+                    Intent i = new Intent(this, LoginActivity.class)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+                    startActivity(i);
+                    finish();
+                }
+            };
+            FirebaseAuth.getInstance().addAuthStateListener(authListener);
+    
+            if (bottomNav != null) {
+                bottomNav.getMenu().clear();
+                bottomNav.inflateMenu(R.menu.bottom_navigation);
+                bottomNav.setOnItemReselectedListener(item -> {});
+                bottomNav.setOnItemSelectedListener(item -> {
+                    long now = SystemClock.elapsedRealtime();
+                    if (now - lastNavClick < 180) return false;
+                    lastNavClick = now;
+    
+                    int id = item.getItemId();
+                    if (id == R.id.nav_monitor) {
+                        switchToFragment(homeFrag);
+                    } else if (id == R.id.nav_plantcare) {
+                        switchToFragment(plantCareFrag);
+                    } else if (id == R.id.nav_capsi) {
+                        if (!"admin".equalsIgnoreCase(userRole) || limitedMode) {
+                            Toast.makeText(this, "Access denied (admin only)", Toast.LENGTH_SHORT).show();
+                            return false;
+                        }
+                        switchToFragment(capsiFrag);
+                    } else if (id == R.id.nav_growth) {
+                        if (!"admin".equalsIgnoreCase(userRole)) {
+                            Toast.makeText(this, "Access denied (admin only)", Toast.LENGTH_SHORT).show();
+                            return false;
+                        }
+                        switchToFragment(growthFrag);
+                    } else if (id == R.id.nav_setting) {
+                        switchToFragment(settingsFrag);
+                    }
+                    return true;
+                });
+            }
+    
+            // Connectivity watcher FIRST
+            setupConnectivityWatcher();
+    
+            boolean onlineNow = hasValidatedInternet();
+            if (!onlineNow) {
+                // Stay in "online mode" UI so we can show the connection dialog.
+                limitedMode = false;
+                if (settingsFrag instanceof SettingFragment) {
+                    ((SettingFragment) settingsFrag).setLimitedMode(false);
+                }
+    
+                // Initialize normal nav for the cached role (no network calls here).
+                initNavForRole(userRole, savedInstanceState);
+    
+                // Show the single, unified dialog
+                showConnectionDialog();
+            } else {
+                String uid = FirebaseAuth.getInstance().getCurrentUser() != null
+                        ? FirebaseAuth.getInstance().getCurrentUser().getUid() : null;
+    
+                if (uid == null) {
+                    initNavForRole(userRole, savedInstanceState);
+                } else {
+                    DatabaseReference usersRef = FirebaseDatabase.getInstance().getReference("users");
+                    usersRef.child(uid).child("role").get().addOnSuccessListener(snapshot -> {
+                        if (snapshot.exists()) {
+                            String cloudRole = normalizeRole(String.valueOf(snapshot.getValue()));
+                            setRoleEverywhere(cloudRole);
+                        }
+                        initNavForRole(userRole, savedInstanceState);
+                    }).addOnFailureListener(e -> initNavForRole(userRole, savedInstanceState));
+                }
+            }
+    
+    
+            handleOpenFragmentExtra(getIntent());
+    
+            // Realtime watchers
+            lastWaterState       = loadLastState("lastWaterState");
+            lastFertilizerState  = loadLastState("lastFertilizerState");
+            lastTemperatureState = loadLastState("lastTemperatureState");
+            lastSoilStatus       = loadLastState("lastSoilStatus");
+            lastStatus           = loadLastState("lastHumidityStatus");
+    
+            FirebaseDatabase db = FirebaseDatabase.getInstance();
+            DatabaseReference temperatureRef = db.getReference("realtime/airTempC");
+            temperatureRef.addValueEventListener(new SimpleNumberListener() {
+                @Override public void onData(Number tempN) {
+                    if (tempN == null) return;
+                    double temperature = tempN.doubleValue();
+
+                    String currentState;
+                    if (temperature < 20.0)       currentState = "low";
+                    else if (temperature <= 35.0) currentState = "ideal";
+                    else                          currentState = "high";
+
+                    // ✅ Skip first snapshot → prevents replay of old alerts when user opens app
+                    if (!primedTemp) {
+                        primedTemp = true;
+                        lastTemperatureState = currentState;
+                        saveLastState("lastTemperatureState", currentState);
+                        return;
+                    }
+
+                    if (!currentState.equals(lastTemperatureState)) {
+                        // Only notify on *transition* after app is open
+                        if ("low".equals(currentState)) {
+                            pushNotif("Low Temperature Alert", "The greenhouse is too cold.");
+                            saveAppNotification("Low Temperature Alert", "Temperature is low. Please check your greenhouse.", "critical");
+                        } else if ("ideal".equals(currentState)) {
+                            saveAppNotification("Ideal Temperature", "Conditions are within the ideal range.", "normal");
+                        } else { // high
+                            pushNotif("High Temperature Alert", "The greenhouse is too hot.");
+                            saveAppNotification("High Temperature Alert", "Temperature is high. Please check cooling.", "warning");
+                        }
+                        lastTemperatureState = currentState;
+                        saveLastState("lastTemperatureState", currentState);
+                    }
+                }
+            });
+
+            // airHumidity (%)
+            DatabaseReference humidityRef = db.getReference("realtime/airHumidity");
+            humidityRef.addValueEventListener(new SimpleNumberListener() {
+                @Override public void onData(Number humidityN) {
+                    if (humidityN == null) return;
+                    int humidity = (int) Math.round(humidityN.doubleValue());
+
+                    String currentStatus;
+                    if (humidity < 50)        currentStatus = "low";
+                    else if (humidity <= 80)  currentStatus = "normal";
+                    else                      currentStatus = "high";
+
+                    if (!primedHum) {
+                        primedHum = true;
+                        lastStatus = currentStatus;
+                        saveLastState("lastHumidityStatus", currentStatus);
+                        return;
+                    }
+
+                    if (!currentStatus.equals(lastStatus)) {
+                        if ("low".equals(currentStatus)) {
+                            pushNotif("Low Humidity", "Air is too dry. Turn on misting.");
+                            saveAppNotification("Low Humidity", "Air is too dry. Turn on misting.", "critical");
+                        } else if ("normal".equals(currentStatus)) {
+                            saveAppNotification("Humidity Normal", "Humidity is in the safe range.", "info");
+                        } else {
+                            pushNotif("High Humidity", "Air is too damp. Risk of mold.");
+                            saveAppNotification("High Humidity", "Air is too damp. Risk of mold.", "warning");
+                        }
+                        lastStatus = currentStatus;
+                        saveLastState("lastHumidityStatus", currentStatus);
+                    }
+                }
+            });
+            DatabaseReference soilMoistureRef = db.getReference("realtime/soilMoisture");
+            soilMoistureRef.addValueEventListener(new SimpleNumberListener() {
+                @Override public void onData(Number soilLevelN) {
+                    if (soilLevelN == null) return;
+                    int soilLevel = (int) Math.round(soilLevelN.doubleValue());
+
+                    String currentStatus;
+                    if (soilLevel < 50)         currentStatus = "dry";
+                    else if (soilLevel <= 75)   currentStatus = "good";
+                    else                        currentStatus = "wet";
+
+                    if (!primedSoil) {
+                        primedSoil = true;
+                        lastSoilStatus = currentStatus;
+                        saveLastState("lastSoilStatus", currentStatus);
+                        return;
+                    }
+
+                    if (!currentStatus.equals(lastSoilStatus)) {
+                        if ("dry".equals(currentStatus)) {
+                            pushNotif("Dry Soil Alert", "Soil moisture is low! Please water the plants.");
+                            saveAppNotification("Dry Soil Alert", "Soil moisture is low! Please water the plants.", "critical");
+                        } else if ("good".equals(currentStatus)) {
+                            saveAppNotification("Soil Level", "Soil moisture is within the optimal range.", "fill");
+                        } else {
+                            saveAppNotification("Wet Soil", "Soil moisture is too high!", "warning");
+                        }
+                        lastSoilStatus = currentStatus;
+                        saveLastState("lastSoilStatus", currentStatus);
+                    }
+                }
+            });
+
+            DatabaseReference waterRef = db.getReference("realtime/waterLevelPct");
+            waterRef.addValueEventListener(new SimpleNumberListener() {
+                @Override public void onData(Number waterLevelN) {
+                    if (waterLevelN == null) return;
+                    int waterLevel = (int) Math.round(waterLevelN.doubleValue());
+
+                    String currentState;
+                    if (waterLevel < 30)       currentState = "low";
+                    else if (waterLevel < 60)  currentState = "mid";
+                    else if (waterLevel < 100) currentState = "normal";
+                    else                       currentState = "full";
+
+                    if (!primedWater) {
+                        primedWater = true;
+                        lastWaterState = currentState;
+                        saveLastState("lastWaterState", currentState);
+                        return;
+                    }
+
+                    if (!currentState.equals(lastWaterState)) {
+                        if ("low".equals(currentState)) {
+                            pushNotif("Low Water Alert", "Water level is low! Please refill.");
+                            saveAppNotification("Low Water Alert", "Water level is low! Please refill.", "critical");
+                        } else if ("mid".equals(currentState)) {
+                            saveAppNotification("Water Level", "Water level is at mid range.", "warning");
+                        } else if ("normal".equals(currentState)) {
+                            saveAppNotification("Water Level", "Water level is good.", "info");
+                        } else { // full
+                            saveAppNotification("Water Full", "Water tank is full.", "fill");
+                        }
+                        lastWaterState = currentState;
+                        saveLastState("lastWaterState", currentState);
+                    }
+                }
+            });
+
+            maybeShowConnectivityUI();
+        }
+    
+    
+        // ------------------ NAVIGATION SETUP ------------------
+    
+        private void initNavLimited(Bundle savedInstanceState) {
+            boolean isAdmin = "admin".equalsIgnoreCase(userRole);
+            FragmentManager fm = getSupportFragmentManager();
+    
+            if (savedInstanceState == null) {
+                fm.beginTransaction()
+                        .setReorderingAllowed(true)
+                        .add(R.id.fragment_container, settingsFrag, "tab_settings").hide(settingsFrag)
+                        .add(R.id.fragment_container, plantCareFrag, "tab_plantcare").hide(plantCareFrag)
+                        .add(R.id.fragment_container, homeFrag, "tab_home")
+                        .commit();
+                active = homeFrag;
+    
+                if (isAdmin) {
+                    fm.beginTransaction()
+                            .setReorderingAllowed(true)
+                            .add(R.id.fragment_container, growthFrag, "tab_growth").hide(growthFrag)
+                            .commit();
+                }
+            } else {
+                Fragment foundHome      = fm.findFragmentByTag("tab_home");
+                Fragment foundPlantCare = fm.findFragmentByTag("tab_plantcare");
+                Fragment foundSettings  = fm.findFragmentByTag("tab_settings");
+                Fragment foundGrowth    = fm.findFragmentByTag("tab_growth");
+    
+                homeFrag      = foundHome      != null ? foundHome      : new HomeFragment();
+                plantCareFrag = foundPlantCare != null ? foundPlantCare : new PlantCareFragment();
+                settingsFrag  = foundSettings  != null ? foundSettings  : new SettingFragment();
+                growthFrag    = foundGrowth    != null ? foundGrowth    : new GrowthStageFragment();
+    
+                if (foundHome == null)
+                    fm.beginTransaction().add(R.id.fragment_container, homeFrag, "tab_home").commitNow();
+                if (foundPlantCare == null)
+                    fm.beginTransaction().add(R.id.fragment_container, plantCareFrag, "tab_plantcare").hide(plantCareFrag).commitNow();
+                if (foundSettings == null)
+                    fm.beginTransaction().add(R.id.fragment_container, settingsFrag, "tab_settings").hide(settingsFrag).commitNow();
+                if (isAdmin && foundGrowth == null)
+                    fm.beginTransaction().add(R.id.fragment_container, growthFrag, "tab_growth").hide(growthFrag).commitNow();
+    
+                if (!homeFrag.isHidden()) active = homeFrag;
+                else if (!plantCareFrag.isHidden()) active = plantCareFrag;
+                else if (isAdmin && !growthFrag.isHidden()) active = growthFrag;
+                else active = settingsFrag;
+            }
+    
+            updateMenuVisibility(isAdmin, true);
+    
+            if (bottomNav != null) {
+                bottomNav.post(() -> bottomNav.setSelectedItemId(R.id.nav_monitor));
+            }
+    
+            updateBottomNavVisibility();
+        }
+    
+        private void initNavForRole(@NonNull String role, Bundle savedInstanceState) {
+            boolean isAdmin = "admin".equalsIgnoreCase(role);
+            FragmentManager fm = getSupportFragmentManager();
+    
+            if (savedInstanceState == null) {
+                fm.beginTransaction()
+                        .setReorderingAllowed(true)
+                        .add(R.id.fragment_container, settingsFrag, "tab_settings").hide(settingsFrag)
+                        .add(R.id.fragment_container, plantCareFrag, "tab_plantcare").hide(plantCareFrag)
+                        .add(R.id.fragment_container, homeFrag, "tab_home")
+                        .commit();
+                active = homeFrag;
+    
+                if (isAdmin) {
+                    fm.beginTransaction()
+                            .setReorderingAllowed(true)
+                            .add(R.id.fragment_container, capsiFrag, "tab_capsi").hide(capsiFrag)
+                            .add(R.id.fragment_container, growthFrag, "tab_growth").hide(growthFrag)
+                            .commit();
+                }
+            } else {
+                Fragment foundHome      = fm.findFragmentByTag("tab_home");
+                Fragment foundPlantCare = fm.findFragmentByTag("tab_plantcare");
+                Fragment foundSettings  = fm.findFragmentByTag("tab_settings");
+                Fragment foundCapsi     = fm.findFragmentByTag("tab_capsi");
+                Fragment foundGrowth    = fm.findFragmentByTag("tab_growth");
+    
+                homeFrag      = foundHome      != null ? foundHome      : new HomeFragment();
+                plantCareFrag = foundPlantCare != null ? foundPlantCare : new PlantCareFragment();
+                settingsFrag  = foundSettings  != null ? foundSettings  : new SettingFragment();
+    
+                if (isAdmin) {
+                    capsiFrag  = foundCapsi  != null ? foundCapsi  : new CapsiViewFragment();
+                    growthFrag = foundGrowth != null ? foundGrowth : new GrowthStageFragment();
+                }
+    
+                if (foundHome == null)
+                    fm.beginTransaction().add(R.id.fragment_container, homeFrag, "tab_home").commitNow();
+                if (foundPlantCare == null)
+                    fm.beginTransaction().add(R.id.fragment_container, plantCareFrag, "tab_plantcare").hide(plantCareFrag).commitNow();
+                if (foundSettings == null)
+                    fm.beginTransaction().add(R.id.fragment_container, settingsFrag, "tab_settings").hide(settingsFrag).commitNow();
+    
+                if (isAdmin) {
+                    if (foundCapsi == null)
+                        fm.beginTransaction().add(R.id.fragment_container, capsiFrag, "tab_capsi").hide(capsiFrag).commitNow();
+                    if (foundGrowth == null)
+                        fm.beginTransaction().add(R.id.fragment_container, growthFrag, "tab_growth").hide(growthFrag).commitNow();
+                }
+    
+                if (!homeFrag.isHidden()) active = homeFrag;
+                else if (!plantCareFrag.isHidden()) active = plantCareFrag;
+                else if (isAdmin && !capsiFrag.isHidden()) active = capsiFrag;
+                else if (isAdmin && !growthFrag.isHidden()) active = growthFrag;
+                else active = settingsFrag;
+            }
+    
+            updateMenuVisibility(isAdmin, false);
+    
+            if (bottomNav != null) {
+                bottomNav.post(() -> bottomNav.setSelectedItemId(R.id.nav_monitor));
+            }
+    
+            updateBottomNavVisibility();
+            enforceRoleUi(isAdmin);
+        }
+    
+
+    
+    
+        private void handleOpenFragmentExtra(Intent intent) {
+            if (intent == null || bottomNav == null) return;
+            String open = intent.getStringExtra("open_fragment");
+            if (open == null) return;
+    
+            switch (open.toLowerCase()) {
+                case "plantcare":
+                    bottomNav.setSelectedItemId(R.id.nav_plantcare);
+                    if (active != plantCareFrag) {
+                        getSupportFragmentManager().beginTransaction()
+                                .setReorderingAllowed(true)
+                                .hide(active)
+                                .show(plantCareFrag)
+                                .runOnCommit(this::updateBottomNavVisibility)
+                                .commit();
+                        active = plantCareFrag;
+                    }
+                    break;
+                case "monitor":
+                    bottomNav.setSelectedItemId(R.id.nav_monitor);
+                    switchToFragment(homeFrag);
+                    break;
+                case "settings":
+                    bottomNav.setSelectedItemId(R.id.nav_setting);
+                    switchToFragment(settingsFrag);
+                    break;
+                case "capsi": {
+                    boolean adminNow = "admin".equalsIgnoreCase(userRole);
+                    if (!limitedMode && bottomNav.getMenu().findItem(R.id.nav_capsi) != null && adminNow) {
+                        bottomNav.setSelectedItemId(R.id.nav_capsi);
+                        if (active != capsiFrag) {
+                            getSupportFragmentManager().beginTransaction()
+                                    .setReorderingAllowed(true)
+                                    .hide(active)
+                                    .show(capsiFrag)
+                                    .runOnCommit(this::updateBottomNavVisibility)
+                                    .commit();
+                            active = capsiFrag;
+                        }
+                    }
+                    break;
+                }
+                case "growth": {
+                    boolean adminNow = "admin".equalsIgnoreCase(userRole);
+                    if (bottomNav.getMenu().findItem(R.id.nav_growth) != null && adminNow) {
+                        bottomNav.setSelectedItemId(R.id.nav_growth);
+                        if (active != growthFrag) {
+                            getSupportFragmentManager().beginTransaction()
+                                    .setReorderingAllowed(true)
+                                    .hide(active)
+                                    .show(growthFrag)
+                                    .runOnCommit(this::updateBottomNavVisibility)
+                                    .commit();
+                            active = growthFrag;
+                        }
+                    }
+                    break;
+                }
+            }
+    
+            intent.removeExtra("open_fragment");
+            setIntent(intent);
+        }
+    
+        // ------------------ NOTIFICATION HELPERS ------------------
+    
+        private void saveAppNotification(String title, String body, String severity) {
+            if (FirebaseAuth.getInstance().getCurrentUser() == null) return;
+            String uid = FirebaseAuth.getInstance().getCurrentUser().getUid();
+            DatabaseReference notifItemsRef = FirebaseDatabase.getInstance()
+                    .getReference("notifications").child(uid).child("items");
+    
+            String key = notifItemsRef.push().getKey();
+    
+            Map<String, Object> data = new HashMap<>();
+            data.put("title", title);
+            data.put("body", body);
+            data.put("severity", severity);
+            data.put("createdAt", System.currentTimeMillis());
+            data.put("read", false);
+    
+            notifItemsRef.child(key).setValue(data);
+    
+            DatabaseReference hasNewRef = FirebaseDatabase.getInstance()
+                    .getReference("notifications").child(uid).child("hasNew");
+            hasNewRef.setValue(true);
+        }
+    
+        private void pushNotif(String title, String msg) {
+            long now = System.currentTimeMillis();
+            if (msg.equals(lastNotifMsg) && (now - lastNotifTime < 60_000)) return;
+            lastNotifTime = now;
+            lastNotifMsg = msg;
+    
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+    
+            Intent intent = new Intent(this, MainActivity.class);
+            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            PendingIntent pendingIntent = PendingIntent.getActivity(
+                    this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+            );
+    
+            NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                    .setColor(ContextCompat.getColor(this, R.color.red))
+                    .setContentTitle(title)
+                    .setContentText(msg)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setAutoCancel(true)
+                    .setContentIntent(pendingIntent);
+    
+            if (nm != null) nm.notify((int) now, builder.build());
+        }
+    
+        // ------------------ LIFECYCLE ------------------
+    
+        @Override
+        protected void onStart() {
+            super.onStart();
+            if (FirebaseAuth.getInstance().getCurrentUser() == null) {
+                Intent i = new Intent(this, LoginActivity.class);
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+                startActivity(i);
+                finish();
+                return;
+            }
+            if (!limitedMode) {
+                maybeShowConnectivityUI();
+                guardAccessOrLogout();
+            }
+        }
+    
+        @Override
+        protected void onNewIntent(Intent intent) {
+            super.onNewIntent(intent);
+            handleOpenFragmentExtra(intent);
+        }
+    
+        @Override
+        protected void onDestroy() {
+            super.onDestroy();
+            if (authListener != null) FirebaseAuth.getInstance().removeAuthStateListener(authListener);
+            teardownConnectivityWatcher();
+            dismissConnectionDialog();
+            dismissRestoredDialog();
+            dismissOfflineStartDialog();
+        }
+    
+        private void guardAccessOrLogout() {
+            if (FirebaseAuth.getInstance().getCurrentUser() == null) return;
+    
+            String uid = FirebaseAuth.getInstance().getCurrentUser().getUid();
+            FirebaseDatabase.getInstance().getReference("users").child(uid)
+                    .get().addOnSuccessListener(snap -> {
+                        String role = String.valueOf(snap.child("role").getValue());
+                        String status = String.valueOf(snap.child("status").getValue());
+                        String r = normalizeRole(role);
+                        String s = status == null ? "" : status.trim().toLowerCase();
+    
+                        boolean isAdmin = "admin".equals(r);
+                        boolean isUser = "user".equals(r);
+                        boolean isApproved = "approved".equals(s);
+                        boolean isRemoved = "removed".equals(r) || "removed".equals(s);
+    
+                        if (isRemoved || !(isAdmin || (isUser && isApproved))) {
+                            FirebaseAuth.getInstance().signOut();
+                            return;
+                        }
+    
+                        setRoleEverywhere(r);
+                        updateMenuVisibility(isAdmin, limitedMode);
+    
+                        if (!isAdmin && (active == capsiFrag || active == growthFrag)) {
+                            getSupportFragmentManager().beginTransaction()
+                                    .setReorderingAllowed(true)
+                                    .hide(active)
+                                    .show(homeFrag)
+                                    .runOnCommit(this::updateBottomNavVisibility)
+                                    .commit();
+                            active = homeFrag;
+                            if (bottomNav != null) {
+                                bottomNav.post(() -> bottomNav.setSelectedItemId(R.id.nav_monitor));
+                            }
+                            Toast.makeText(this, "Access denied (admin only)", Toast.LENGTH_SHORT).show();
+                        }
+                    })
+                    .addOnFailureListener(e -> {
+                        updateMenuVisibility("admin".equalsIgnoreCase(userRole), limitedMode);
+                    });
+        }
+    
+        // ------- IMMERSIVE HELPERS -------
+    
+        private void applyImmersiveToWindow(@NonNull Window window) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                WindowInsetsController controller = window.getInsetsController();
+                if (controller != null) {
+                    controller.hide(WindowInsets.Type.navigationBars());
+                    controller.setSystemBarsBehavior(
+                            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    );
+                }
+            } else {
+                final View decor = window.getDecorView();
+                final int flags =
+                        View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
+    
+                decor.setSystemUiVisibility(flags);
+                decor.setOnSystemUiVisibilityChangeListener(
+                        visibility -> decor.setSystemUiVisibility(flags));
+            }
+        }
+    
+        // ------------------ CHANNEL + DAILY SCHEDULE ------------------
+    
+        private void createNotificationChannel() {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                CharSequence name = "General";
+                String description = "General notifications";
+                int importance = NotificationManager.IMPORTANCE_DEFAULT;
+                NotificationChannel channel = new NotificationChannel(CHANNEL_ID, name, importance);
+                channel.setDescription(description);
+                NotificationManager manager = getSystemService(NotificationManager.class);
+                if (manager != null) manager.createNotificationChannel(channel);
+            }
+        }
+    
+        private void scheduleNotification() {
+            Intent intent = new Intent(this, NotificationPublisher.class);
+            PendingIntent pendingIntent = PendingIntent.getBroadcast(
+                    this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    
+            long triggerTime = System.currentTimeMillis() + (24 * 60 * 60 * 1000);
+    
+            AlarmManager alarmManager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (alarmManager != null) {
+                alarmManager.setRepeating(
+                        AlarmManager.RTC_WAKEUP, triggerTime, (24 * 60 * 60 * 1000), pendingIntent);
+            }
+        }
+    
+        // ------------------ HELPERS ------------------
+    
+        private void saveLastState(String key, String value) {
+            getSharedPreferences("AppPrefs", MODE_PRIVATE).edit().putString(key, value).apply();
+        }
+        private String loadLastState(String key) {
+            return getSharedPreferences("AppPrefs", MODE_PRIVATE).getString(key, "");
+        }
+    
+        private void updateBottomNavVisibility() {
+            if (bottomNav == null) return;
+            boolean show = true;
+            Fragment top = getTopVisibleFragment();
+            if (top instanceof BottomNavVisibility) {
+                show = ((BottomNavVisibility) top).isBottomNavVisible();
+            }
+            bottomNav.setVisibility(show ? View.VISIBLE : View.GONE);
+        }
+    
+        private Fragment getTopVisibleFragment() {
+            FragmentManager fm = getSupportFragmentManager();
+            List<Fragment> list = fm.getFragments();
+            for (int i = list.size() - 1; i >= 0; i--) {
+                Fragment f = list.get(i);
+                if (f != null && f.isVisible()) return f;
+            }
+            return fm.findFragmentById(R.id.fragment_container);
+        }
+    
+        @Override
+        protected void onResume() {
+            super.onResume();
+            hideSystemUI();
+            updateBottomNavVisibility();
+            maybeShowConnectivityUI();
+        }
+    
+        public void openNotification(@NonNull String uid) {
+            getSupportFragmentManager().beginTransaction()
+                    .setReorderingAllowed(true)
+                    .replace(R.id.fragment_container, NotificationFragment.newInstance(uid))
+                    .addToBackStack("notifications")
+                    .runOnCommit(this::updateBottomNavVisibility)
+                    .commit();
+        }
+    
+        public void openNotificationsByRole() {
+            if (FirebaseAuth.getInstance().getCurrentUser() == null) return;
+            String uid = FirebaseAuth.getInstance().getCurrentUser().getUid();
+            String bucket = "admin".equalsIgnoreCase(userRole) ? "_admin" : uid;
+            openNotification(bucket);
+        }
+    
+        public void showBottomNav(boolean show) {
+            if (bottomNav != null) bottomNav.setVisibility(show ? View.VISIBLE : View.GONE);
+        }
+    
+        private Insets getStableSystemBarInsets(WindowInsetsCompat insets) {
+            if (Build.VERSION.SDK_INT >= 30) {
+                return insets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.systemBars());
+            } else {
+                return insets.getInsets(WindowInsetsCompat.Type.systemBars());
+            }
+        }
+    
+        private void switchToFragment(Fragment target) {
+            if (target == null || target == active) return;
+            getSupportFragmentManager().beginTransaction()
+                    .setReorderingAllowed(true)
+                    .setCustomAnimations(0, 0, 0, 0)
+                    .hide(active)
+                    .show(target)
+                    .runOnCommit(this::updateBottomNavVisibility)
+                    .commit();
+            active = target;
+        }
+    
+        private void hideSystemUI() {
+            applyImmersiveToWindow(getWindow());
+        }
+    
+        @Override
+        public void onWindowFocusChanged(boolean hasFocus) {
+            super.onWindowFocusChanged(hasFocus);
+            if (hasFocus) hideSystemUI();
+        }
+    
+        // =====================================================================
+        //        Connectivity watcher + Limited/Online mode switching UI
+        // =====================================================================
+    
+        private void setupConnectivityWatcher() {
+            // Ensure manager
+            connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (connectivityManager == null) return;
+    
+            // If already registered, unregister first to avoid duplicates
+            if (networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
+                networkCallback = null;
+            }
+    
+            networkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override public void onAvailable(@NonNull Network network) {
+                    runOnUiThread(() -> {
+                        if (!isFinishing() && !isDestroyed()) {
+                            maybeShowConnectivityUI();
+                            // Only enforce role / auth when we're not in limited mode.
+                            if (!limitedMode) guardAccessOrLogout();
+                        }
+                    });
+                }
+                @Override public void onLost(@NonNull Network network) {
+                    runOnUiThread(() -> {
+                        if (!isFinishing() && !isDestroyed()) {
+                            maybeShowConnectivityUI();
+                        }
+                    });
+                }
+                @Override public void onCapabilitiesChanged(@NonNull Network network, @NonNull NetworkCapabilities caps) {
+                    runOnUiThread(() -> {
+                        if (!isFinishing() && !isDestroyed()) {
+                            maybeShowConnectivityUI();
+                        }
+                    });
+                }
+            };
+    
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                try {
+                    connectivityManager.registerDefaultNetworkCallback(networkCallback);
+                } catch (Exception ignored) {}
+            }
+    
+            // Evaluate immediately so UI reflects current state on launch
+            maybeShowConnectivityUI();
+        }
+    
+        private void teardownConnectivityWatcher() {
+            if (connectivityManager != null && networkCallback != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
+            }
+        }
+    
+        private boolean hasValidatedInternet() {
+            if (connectivityManager == null) {
+                connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (connectivityManager == null) return false;
+            }
+            Network network = connectivityManager.getActiveNetwork();
+            if (network == null) return false;
+            NetworkCapabilities caps = connectivityManager.getNetworkCapabilities(network);
+            if (caps == null) return false;
+    
+            boolean hasInternet = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+            boolean validated = Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                    || caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+            return hasInternet && validated;
+        }
+    
+        private void maybeShowConnectivityUI() {
+            boolean ok = hasValidatedInternet();
+    
+            if (limitedMode) {
+                dismissConnectionDialog();
+                if (ok) showRestoredDialog();
+                else    dismissRestoredDialog();
+                return;
+            }
+    
+            dismissRestoredDialog();
+            if (ok) {
+                dismissConnectionDialog();
+            } else {
+                showConnectionDialog();
+            }
+        }
+    
+        // ------------------ SIMPLE / CLEAN POPUPS ------------------
+    // --- CONNECTION: No Internet (online mode) ---
+        private void showConnectionDialog() {
+            if (isFinishing() || isDestroyed()) return;
+            if (connectionDialog != null && connectionDialog.isShowing()) return;
+    
+            connectionDialog = showStackedPopup(
+                    "No Internet Connection",
+                    "Connect to a network or the iCapsicum-AP to enable offline access.",
+                    "Try Again",
+                    v -> {
+                        if (hasValidatedInternet()) {
+                            dismissConnectionDialog();
+                            guardAccessOrLogout();
+                            Toast.makeText(this, "Back online", Toast.LENGTH_SHORT).show();
+                        } else {
+                            dismissConnectionDialog();
+                            showConnectionDialog();
+                        }
+                    },
+                    "Connect to ESP AP",
+                    v -> switchToLimitedModeInPlace(),
+                    false
+            );
+        }
+    
+        // --- INTERNET RESTORED while in Limited Mode ---
+        private void showRestoredDialog() {
+            if (isFinishing() || isDestroyed()) return;
+            if (restoredDialog != null && restoredDialog.isShowing()) return;
+    
+            restoredDialog = showStackedPopup(
+                    "Internet Restored",
+                    "You're back online. Do you want to leave Limited Mode?",
+                    "Go Online",
+                    v -> switchToOnlineModeInPlace(),
+                    "Stay Offline",
+                    v -> dismissRestoredDialog(),
+                    false
+            );
+        }
+    
+        // === Stacked popup: centered, compressed, rounded buttons ===
+        private AlertDialog showStackedPopup(
+                @NonNull String titleText,
+                @NonNull String messageText,
+                @NonNull String primaryText,                 // top button text
+                @NonNull View.OnClickListener primaryAction, // top button action
+                String secondaryText,                        // bottom button (nullable)
+                View.OnClickListener secondaryAction,        // bottom button action (nullable)
+                boolean dismissible
+        ) {
+            com.google.android.material.card.MaterialCardView card = new com.google.android.material.card.MaterialCardView(this);
+            int padH = dp(16), padV = dp(10);
+            card.setUseCompatPadding(false);
+            card.setCardElevation(0);
+            card.setStrokeWidth(0);
+            card.setBackgroundResource(R.drawable.popup_bg);
+            card.setContentPadding(padH, padV, padH, padV);
+    
+            android.widget.LinearLayout col = new android.widget.LinearLayout(this);
+            col.setOrientation(android.widget.LinearLayout.VERTICAL);
+            col.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
+            card.addView(col, new ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            ));
+    
+            TextView title = new TextView(this);
+            title.setText(titleText);
+            title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+            title.setTextColor(Color.parseColor("#1F1F1F"));
+            title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+            title.setGravity(android.view.Gravity.CENTER);
+            col.addView(title);
+    
+            boolean online = hasValidatedInternet();
+            String pillText = online ? "ONLINE" : "OFFLINE";
+            int pillBg = online ? Color.parseColor("#E7F6EC") : Color.parseColor("#FDECEA");
+            int pillFg = online ? Color.parseColor("#1B5E20") : Color.parseColor("#B71C1C");
+            View pill = buildStatusPill(pillText, pillBg, pillFg);
+            android.widget.LinearLayout.LayoutParams pillLp =
+                    new android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            pillLp.topMargin = dp(6);
+            col.addView(pill, pillLp);
+    
+            TextView msg = new TextView(this);
+            msg.setText(messageText);
+            msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            msg.setTextColor(Color.parseColor("#424242"));
+            msg.setGravity(android.view.Gravity.CENTER);
+            msg.setPadding(0, dp(6), 0, dp(10));
+            col.addView(msg);
+    
+            Button btnTop = buildFilledGreenButton(primaryText);
+            android.widget.LinearLayout.LayoutParams btnLp =
+                    new android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            col.addView(btnTop, btnLp);
+    
+            Button btnBottom = null;
+            if (secondaryText != null && secondaryAction != null) {
+                View space = new View(this);
+                col.addView(space, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8)));
+    
+                btnBottom = buildFilledGreenButton(secondaryText);
+                col.addView(btnBottom, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            }
+    
+            AlertDialog dialog = new AlertDialog.Builder(this)
+                    .setView(card)
+                    .setCancelable(dismissible)
+                    .create();
+    
+            dialog.setOnShowListener(d -> {
+                if (dialog.getWindow() != null) {
+                    dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+                    dialog.getWindow().setDimAmount(0.28f);
+                    int screenW = getResources().getDisplayMetrics().widthPixels;
+                    int targetW = Math.min((int) (screenW * 0.84f), dp(320));
+                    dialog.getWindow().setLayout(targetW, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    applyImmersiveToWindow(dialog.getWindow());
+                }
+            });
+            dialog.setOnDismissListener(d -> hideSystemUI());
+    
+            dialog.show();
+            if (dialog.getWindow() != null) applyImmersiveToWindow(dialog.getWindow());
+    
+            btnTop.setOnClickListener(v -> { dialog.dismiss(); primaryAction.onClick(v); });
+            if (btnBottom != null) {
+                Button finalBtnBottom = btnBottom;
+                finalBtnBottom.setOnClickListener(v -> { dialog.dismiss(); secondaryAction.onClick(v); });
+            }
+    
+            return dialog;
+        }
+    
+        private View buildStatusPill(@NonNull String text, int bgColor, int fgColor) {
+            TextView chip = new TextView(this);
+            chip.setText(text);
+            chip.setAllCaps(true);
+            chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            chip.setTextColor(fgColor);
+            chip.setPadding(dp(8), dp(4), dp(8), dp(4));
+            chip.setBackground(new android.graphics.drawable.GradientDrawable() {{
+                setColor(bgColor);
+                setCornerRadius(dp(12));
+            }});
+            return chip;
+        }
+    
+        private Button buildFilledGreenButton(@NonNull String text) {
+            Button b = new Button(this);
+            b.setText(text);
+            b.setAllCaps(false);
+            b.setTextColor(Color.WHITE);
+            b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setColor(Color.parseColor("#4CAF50"));
+            bg.setCornerRadius(dp(10));
+            b.setBackground(bg);
+            int vPad = dp(10), hPad = dp(16);
+            b.setPadding(hPad, vPad, hPad, vPad);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) b.setElevation(dp(1));
+            return b;
+        }
+    
+        private int dp(int v) {
+            return Math.round(TypedValue.applyDimension(
+                    TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics()));
+        }
+    
+        private void dismissConnectionDialog() {
+            if (connectionDialog != null) {
+                try { connectionDialog.dismiss(); } catch (Exception ignored) {}
+                connectionDialog = null;
+            }
+        }
+    
+        private void dismissOfflineStartDialog() {
+            if (offlineStartDialog != null) {
+                try { offlineStartDialog.dismiss(); } catch (Exception ignored) {}
+                offlineStartDialog = null;
+            }
+        }
+    
+        private void dismissRestoredDialog() {
+            if (restoredDialog != null) {
+                try { restoredDialog.dismiss(); } catch (Exception ignored) {}
+                restoredDialog = null;
+            }
+        }
+    
+        // Compact popup with ICaps mascot on the right
+        private AlertDialog showSimplePopup(
+                @NonNull String titleText,
+                @NonNull String messageText,
+                @NonNull String primaryText,
+                @NonNull View.OnClickListener primaryAction,
+                String secondaryText,
+                View.OnClickListener secondaryAction,
+                boolean dismissible
+        ) {
+            com.google.android.material.card.MaterialCardView card = new com.google.android.material.card.MaterialCardView(this);
+            int padH = dp(20), padV = dp(16);
+            card.setUseCompatPadding(false);
+            card.setCardElevation(0);
+            card.setStrokeWidth(0);
+            card.setBackgroundResource(R.drawable.popup_bg);
+            card.setContentPadding(padH, padV, padH, padV);
+    
+            android.widget.LinearLayout header = new android.widget.LinearLayout(this);
+            header.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            header.setPadding(0, 0, 0, dp(12));
+            card.addView(header, new ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+    
+            android.widget.LinearLayout textCol = new android.widget.LinearLayout(this);
+            textCol.setOrientation(android.widget.LinearLayout.VERTICAL);
+            android.widget.LinearLayout.LayoutParams textLp =
+                    new android.widget.LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            header.addView(textCol, textLp);
+    
+            TextView title = new TextView(this);
+            title.setText(titleText);
+            title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+            title.setTextColor(Color.parseColor("#222222"));
+            title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+            textCol.addView(title);
+    
+            TextView msg = new TextView(this);
+            msg.setText(messageText);
+            msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            msg.setTextColor(Color.parseColor("#666666"));
+            msg.setPadding(0, dp(8), 0, 0);
+            textCol.addView(msg);
+    
+            ImageView mascot = new ImageView(this);
+            mascot.setImageResource(R.drawable.bell1); // adjust if named differently
+            mascot.setAdjustViewBounds(true);
+            mascot.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            android.widget.LinearLayout.LayoutParams imgLp =
+                    new android.widget.LinearLayout.LayoutParams(dp(56), dp(56));
+            imgLp.setMarginStart(dp(12));
+            header.addView(mascot, imgLp);
+    
+            android.widget.LinearLayout row = new android.widget.LinearLayout(this);
+            row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+            row.setGravity(android.view.Gravity.END);
+            card.addView(row);
+    
+            Button secondaryBtn = null;
+            if (secondaryText != null && secondaryAction != null) {
+                secondaryBtn = new Button(this);
+                secondaryBtn.setText(secondaryText);
+                secondaryBtn.setAllCaps(false);
+                secondaryBtn.setBackgroundColor(Color.TRANSPARENT);
+                secondaryBtn.setTextColor(Color.parseColor("#666666"));
+                secondaryBtn.setPadding(dp(8), dp(8), dp(8), dp(8));
+                row.addView(secondaryBtn);
+            }
+    
+            Button primaryBtn = new Button(this);
+            primaryBtn.setText(primaryText);
+            primaryBtn.setAllCaps(false);
+            stylePrimaryButton(primaryBtn);
+            row.addView(primaryBtn);
+    
+            AlertDialog dialog = new AlertDialog.Builder(this)
+                    .setView(card)
+                    .setCancelable(dismissible)
+                    .create();
+    
+            dialog.setOnShowListener(d -> {
+                if (dialog.getWindow() != null) {
+                    dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+                    dialog.getWindow().setDimAmount(0.35f);
+                    int screenW = getResources().getDisplayMetrics().widthPixels;
+                    int targetW = Math.min((int) (screenW * 0.88f), dp(420));
+                    dialog.getWindow().setLayout(targetW, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    applyImmersiveToWindow(dialog.getWindow());
+                }
+            });
+            dialog.setOnDismissListener(d -> hideSystemUI());
+    
+            dialog.show();
+            if (dialog.getWindow() != null) applyImmersiveToWindow(dialog.getWindow());
+    
+            if (secondaryBtn != null) {
+                Button finalSecondaryBtn = secondaryBtn;
+                finalSecondaryBtn.setOnClickListener(v -> { dialog.dismiss(); secondaryAction.onClick(v); });
+            }
+            primaryBtn.setOnClickListener(v -> { dialog.dismiss(); primaryAction.onClick(v); });
+    
+            return dialog;
+        }
+    
+        private void stylePrimaryButton(@NonNull Button b) {
+            b.setTextColor(Color.WHITE);
+            b.setBackgroundColor(Color.parseColor("#4CAF50"));
+            int hPad = dp(16), vPad = dp(10);
+            b.setPadding(hPad, vPad, hPad, vPad);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                b.setElevation(dp(2));
+            }
+        }
+        private void switchToLimitedModeInPlace() {
+            dismissConnectionDialog();
+            dismissRestoredDialog();
+            dismissOfflineStartDialog();
+    
+            boolean onlineNow = hasValidatedInternet();
+            enteredLimitedDueToNoInternet = !onlineNow; // track reason
+    
+            limitedMode = true;
+            if (settingsFrag instanceof SettingFragment) {
+                ((SettingFragment) settingsFrag).setLimitedMode(true);
+            }
+    
+            FragmentManager fm = getSupportFragmentManager();
+            for (Fragment f : fm.getFragments()) {
+                try { fm.beginTransaction().remove(f).commitNow(); } catch (Exception ignored) {}
+            }
+    
+            initNavLimited(null);
+    
+            // ✅ Only show toast when offline and NOT connected to Firebase
+            if (!onlineNow) {
+                String ssid = getCurrentSsid();
+                if (ssid != null && ssid.equalsIgnoreCase("iCapsicum-AP")) {
+                    Toast.makeText(this, "Limited Mode: Connected to ESP32 AP (" + ssid + ")", Toast.LENGTH_LONG).show();
+                } else {
+                    Toast.makeText(this,   "No internet connection. Please connect to iCapsicum-AP", Toast.LENGTH_LONG).show();
+                }
+            }
+    
+    
+            hideSystemUI();
+            if (bottomNav != null) bottomNav.post(() -> bottomNav.setSelectedItemId(R.id.nav_monitor));
+        }
+    
+        /** Helper to get current Wi-Fi SSID */
+        /** Helper to get current Wi-Fi SSID safely */
+        private String getCurrentSsid() {
+            try {
+                WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                if (wifiManager == null) return null;
+    
+                WifiInfo info = wifiManager.getConnectionInfo();
+                if (info == null) return null;
+    
+                String ssid = info.getSSID();
+                if (ssid == null) return null;
+    
+                // Clean quotes returned by Android
+                ssid = ssid.replace("\"", "");
+    
+                // On Android 8+ if location permissions are missing, returns <unknown ssid>
+                if ("<unknown ssid>".equalsIgnoreCase(ssid)) {
+                    return null;
+                }
+    
+                return ssid;
+            } catch (Exception e) {
+                e.printStackTrace();
+                return null;
+            }
+        }
+    
+    
+        private void switchToOnlineModeInPlace() {
+            dismissConnectionDialog();
+            dismissRestoredDialog();
+            dismissOfflineStartDialog();
+    
+            enteredLimitedDueToNoInternet = false; // reset
+    
+            limitedMode = false;
+            if (settingsFrag instanceof SettingFragment) {
+                ((SettingFragment) settingsFrag).setLimitedMode(false);
+            }
+    
+            FragmentManager fm = getSupportFragmentManager();
+            for (Fragment f : fm.getFragments()) {
+                try { fm.beginTransaction().remove(f).commitNow(); } catch (Exception ignored) {}
+            }
+    
+            initNavForRole(userRole == null ? DEFAULT_ROLE : userRole, null);
+            guardAccessOrLogout();
+            Toast.makeText(this, "Online Mode restored", Toast.LENGTH_SHORT).show();
+            hideSystemUI();
+            if (bottomNav != null) bottomNav.post(() -> bottomNav.setSelectedItemId(R.id.nav_monitor));
+        }
+    
+        private void updateMenuVisibility(boolean isAdmin, boolean isLimited) {
+            if (bottomNav == null || bottomNav.getMenu() == null) return;
+    
+            setItemVisible(R.id.nav_monitor, true);
+            setItemVisible(R.id.nav_plantcare, true);
+            setItemVisible(R.id.nav_setting, true);
+    
+            setItemVisible(R.id.nav_capsi, isAdmin && !isLimited);
+            setItemVisible(R.id.nav_growth, isAdmin);
+        }
+    
+        private void setItemVisible(int itemId, boolean visible) {
+            if (bottomNav == null || bottomNav.getMenu() == null) return;
+            if (bottomNav.getMenu().findItem(itemId) != null) {
+                bottomNav.getMenu().findItem(itemId).setVisible(visible);
+            }
+        }
+    
+        private void enforceRoleUi(boolean isAdmin) {
+            updateMenuVisibility(isAdmin, limitedMode);
+            if (!isAdmin && (active == capsiFrag || active == growthFrag)) {
+                getSupportFragmentManager().beginTransaction()
+                        .setReorderingAllowed(true)
+                        .hide(active)
+                        .show(homeFrag)
+                        .runOnCommit(this::updateBottomNavVisibility)
+                        .commit();
+                active = homeFrag;
+                if (bottomNav != null) {
+                    bottomNav.post(() -> bottomNav.setSelectedItemId(R.id.nav_monitor));
+                }
+                Toast.makeText(this, "Access denied (admin only)", Toast.LENGTH_SHORT).show();
+            }
+        }
+    
+        // ------------------ Role Cache ------------------
+    
+        private void saveCachedRole(@NonNull String role) {
+            getSharedPreferences(PREFS_USER, MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_ROLE, normalizeRole(role))
+                    .apply();
+        }
+        private String loadCachedRole() {
+            String cached = getSharedPreferences(PREFS_USER, MODE_PRIVATE).getString(KEY_ROLE, "");
+            return cached == null ? "" : cached;
+        }
+    
+        // ------------------ SimpleNumberListener ------------------
+        // Robustly converts RTDB values to Number (handles Double/Long/String)
+        private abstract static class SimpleNumberListener implements com.google.firebase.database.ValueEventListener {
+            @Override public void onDataChange(@NonNull com.google.firebase.database.DataSnapshot snapshot) {
+                Number out = null;
+                Object v = snapshot.getValue();
+                if (v instanceof Number) {
+                    out = (Number) v;
+                } else if (v instanceof String) {
+                    try { out = Double.valueOf((String) v); } catch (Exception ignored) {}
+                }
+                onData(out);
+            }
+            @Override public void onCancelled(@NonNull com.google.firebase.database.DatabaseError error) { }
+            public abstract void onData(Number value);
+        }
+    }
